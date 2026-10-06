@@ -1,0 +1,15 @@
+{
+    "name": "rafalmasiarek/dns-resolver",
+    "description": "Minimal PSR-agnostic DNS resolver contract (A/AAAA) with a zero-config system-resolver default — extracted from rafalmasiarek/http-client.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "rafalmasiarek\\DnsResolver\\": "src/"
+        }
+    },
+    "minimum-stability": "stable"
+}
