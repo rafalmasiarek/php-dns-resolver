@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace rafalmasiarek\DnsResolver;
 
+use rafalmasiarek\DnsResolver\Transport\TcpTransport;
+use rafalmasiarek\DnsResolver\Transport\UdpTransport;
+
 /**
  * From-scratch DNS client (RFC 1035) resolving over raw UDP/TCP against an
  * explicit resolver, with its own connect/read timeout.
@@ -20,15 +23,17 @@ namespace rafalmasiarek\DnsResolver;
  * When a response still arrives with the TC (truncated) bit set, the same
  * query is retried once over TCP.
  *
+ * Message encoding/decoding lives in DnsMessageEncoder/DnsMessageDecoder
+ * (pure, socket-free); the wire transport lives in Transport\UdpTransport/
+ * TcpTransport. This class owns only the per-type public API, the
+ * UDP-then-TCP-on-truncation orchestration, and the concurrent batch path.
+ *
  * @package rafalmasiarek\DnsResolver
  */
 final class DnsClient implements DnsResolverInterface
 {
     /** @var int DNS record type A (host address). */
     private const TYPE_A = 1;
-
-    /** @var int DNS record type NS, read only as part of the authority-section SOA scan. */
-    private const TYPE_SOA = 6;
 
     /** @var int DNS record type MX (mail exchanger). */
     private const TYPE_MX = 15;
@@ -42,26 +47,14 @@ final class DnsClient implements DnsResolverInterface
     /** @var int DNS record type PTR (reverse-lookup pointer). */
     private const TYPE_PTR = 12;
 
-    /** @var int DNS record type OPT (EDNS0 pseudo-record). */
-    private const TYPE_OPT = 41;
-
-    /** @var int DNS class IN (internet). */
-    private const CLASS_IN = 1;
-
-    /** @var int UDP payload size advertised via EDNS0. */
-    private const EDNS0_UDP_PAYLOAD_SIZE = 4096;
-
-    /** @var int Maximum UDP response size accepted — matches the EDNS0 payload size advertised. */
+    /** @var int Maximum UDP response size accepted — matches the EDNS0 payload size advertised.
+     *            Duplicated from Transport\UdpTransport: resolveManyA() manages its own
+     *            non-blocking sockets directly (concurrent across many hostnames via a
+     *            single stream_select() loop) rather than delegating to that transport. */
     private const MAX_UDP_RESPONSE_BYTES = 4096;
 
-    /** @var int Maximum TCP response size accepted (the 2-byte length prefix's own ceiling). */
-    private const MAX_TCP_RESPONSE_BYTES = 65535;
-
-    /** @var int Bitmask for the TC (Truncated) flag within the 16-bit flags word. */
-    private const FLAG_TC = 0x0200;
-
-    /** @var int Bitmask for the AD (Authenticated Data) flag within the 16-bit flags word. */
-    private const FLAG_AD = 0x0020;
+    private readonly UdpTransport $udpTransport;
+    private readonly TcpTransport $tcpTransport;
 
     /**
      * @param string $resolver Resolver IP address to query.
@@ -72,7 +65,10 @@ final class DnsClient implements DnsResolverInterface
         private readonly string $resolver,
         private readonly int    $port,
         private readonly float  $timeout,
-    ) {}
+    ) {
+        $this->udpTransport = new UdpTransport($resolver, $port, $timeout);
+        $this->tcpTransport = new TcpTransport($resolver, $port, $timeout);
+    }
 
     /**
      * Returns a clone of this client with a different timeout — used by
@@ -236,7 +232,7 @@ final class DnsClient implements DnsResolverInterface
 
         foreach ($unique as $hostname) {
             $id = \random_int(0, 0xFFFF);
-            $query = $this->buildQuery($hostname, $id, self::TYPE_A);
+            $query = DnsMessageEncoder::buildQuery($hostname, $id, self::TYPE_A);
 
             $socket = @\stream_socket_client(
                 "udp://{$this->resolver}:{$this->port}",
@@ -304,7 +300,7 @@ final class DnsClient implements DnsResolverInterface
                 }
 
                 try {
-                    $results[$item['hostname']] = $this->parseResponse($response, $item['id'], self::TYPE_A);
+                    $results[$item['hostname']] = DnsMessageDecoder::decode($response, $item['id'], self::TYPE_A);
                 } catch (DnsQueryException $e) {
                     $results[$item['hostname']] = $e;
                 }
@@ -336,452 +332,14 @@ final class DnsClient implements DnsResolverInterface
     private function query(string $hostname, int $type): DnsAnswer
     {
         $id = \random_int(0, 0xFFFF);
-        $query = $this->buildQuery($hostname, $id, $type);
+        $query = DnsMessageEncoder::buildQuery($hostname, $id, $type);
 
-        $response = $this->sendUdp($query);
+        $response = $this->udpTransport->send($query);
 
-        if ($this->isTruncated($response)) {
-            $response = $this->sendTcp($query);
+        if (DnsMessageDecoder::isTruncated($response)) {
+            $response = $this->tcpTransport->send($query);
         }
 
-        return $this->parseResponse($response, $id, $type);
-    }
-
-    /**
-     * Sends a query over UDP and returns the raw response.
-     *
-     * @param string $query Binary DNS query packet.
-     *
-     * @throws DnsTimeoutException When no response arrives within the timeout.
-     * @throws DnsQueryException On socket failure.
-     *
-     * @return string
-     */
-    private function sendUdp(string $query): string
-    {
-        $socket = @\stream_socket_client(
-            "udp://{$this->resolver}:{$this->port}",
-            $errno,
-            $errstr,
-            $this->timeout,
-            \STREAM_CLIENT_CONNECT
-        );
-
-        if ($socket === false) {
-            throw new DnsQueryException("Unable to connect to resolver {$this->resolver}:{$this->port}: {$errstr}");
-        }
-
-        try {
-            \stream_set_timeout($socket, (int) $this->timeout, (int) (\fmod($this->timeout, 1.0) * 1_000_000));
-
-            if (@\fwrite($socket, $query) === false) {
-                throw new DnsQueryException("Unable to send DNS query to {$this->resolver}:{$this->port}");
-            }
-
-            $response = @\fread($socket, self::MAX_UDP_RESPONSE_BYTES);
-            $meta = \stream_get_meta_data($socket);
-
-            if ($meta['timed_out']) {
-                throw new DnsTimeoutException("DNS query to {$this->resolver}:{$this->port} timed out after {$this->timeout}s");
-            }
-
-            if ($response === false || $response === '') {
-                throw new DnsQueryException("Empty response from resolver {$this->resolver}:{$this->port}");
-            }
-        } finally {
-            \fclose($socket);
-        }
-
-        return $response;
-    }
-
-    /**
-     * Sends a query over TCP (2-byte length prefix framing, RFC 1035 §4.2.2)
-     * and returns the raw response, for when the UDP response was truncated.
-     *
-     * @param string $query Binary DNS query packet.
-     *
-     * @throws DnsTimeoutException When no response arrives within the timeout.
-     * @throws DnsQueryException On socket failure.
-     *
-     * @return string
-     */
-    private function sendTcp(string $query): string
-    {
-        $socket = @\stream_socket_client(
-            "tcp://{$this->resolver}:{$this->port}",
-            $errno,
-            $errstr,
-            $this->timeout,
-            \STREAM_CLIENT_CONNECT
-        );
-
-        if ($socket === false) {
-            throw new DnsQueryException("Unable to connect to resolver {$this->resolver}:{$this->port} over TCP: {$errstr}");
-        }
-
-        try {
-            \stream_set_timeout($socket, (int) $this->timeout, (int) (\fmod($this->timeout, 1.0) * 1_000_000));
-
-            $framed = \pack('n', \strlen($query)) . $query;
-            if (@\fwrite($socket, $framed) === false) {
-                throw new DnsQueryException("Unable to send DNS query to {$this->resolver}:{$this->port} over TCP");
-            }
-
-            $lengthPrefix = $this->readExactly($socket, 2);
-            $meta = \stream_get_meta_data($socket);
-            if ($meta['timed_out']) {
-                throw new DnsTimeoutException("DNS query to {$this->resolver}:{$this->port} over TCP timed out after {$this->timeout}s");
-            }
-
-            $length = \unpack('n', $lengthPrefix)[1];
-            $response = $this->readExactly($socket, \min($length, self::MAX_TCP_RESPONSE_BYTES));
-
-            $meta = \stream_get_meta_data($socket);
-            if ($meta['timed_out']) {
-                throw new DnsTimeoutException("DNS query to {$this->resolver}:{$this->port} over TCP timed out after {$this->timeout}s");
-            }
-        } finally {
-            \fclose($socket);
-        }
-
-        return $response;
-    }
-
-    /**
-     * Reads exactly $length bytes from a TCP stream, looping over partial reads.
-     *
-     * @param resource $socket
-     * @param int $length
-     *
-     * @throws DnsQueryException When the connection closes before $length bytes arrive.
-     *
-     * @return string
-     */
-    private function readExactly($socket, int $length): string
-    {
-        $buffer = '';
-        while (\strlen($buffer) < $length) {
-            $chunk = @\fread($socket, $length - \strlen($buffer));
-            if ($chunk === false || $chunk === '') {
-                $meta = \stream_get_meta_data($socket);
-                if ($meta['timed_out']) {
-                    return $buffer;
-                }
-                throw new DnsQueryException("TCP connection to {$this->resolver}:{$this->port} closed unexpectedly");
-            }
-            $buffer .= $chunk;
-        }
-        return $buffer;
-    }
-
-    /**
-     * Whether a raw response packet has the TC (truncated) flag set.
-     *
-     * @param string $data
-     *
-     * @return bool
-     */
-    private function isTruncated(string $data): bool
-    {
-        if (\strlen($data) < 4) {
-            return false;
-        }
-        $flags = \unpack('n', \substr($data, 2, 2))[1];
-        return ($flags & self::FLAG_TC) !== 0;
-    }
-
-    /**
-     * Builds a single-question DNS query packet with an EDNS0 OPT pseudo-record
-     * advertising a 4096-byte UDP payload size and requesting the DNSSEC OK bit.
-     *
-     * @param string $hostname
-     * @param int $id 16-bit query identifier, echoed back in the response.
-     * @param int $type DNS record type.
-     *
-     * @return string Binary DNS query packet.
-     */
-    private function buildQuery(string $hostname, int $id, int $type): string
-    {
-        $header = \pack(
-            'nnnnnn',
-            $id,
-            0x0120, // RD=1 (recursion desired) + AD=1 (signals interest in a meaningful AD bit back)
-            1,      // QDCOUNT
-            0,      // ANCOUNT
-            0,      // NSCOUNT
-            1       // ARCOUNT — the EDNS0 OPT record below
-        );
-
-        $question = $this->encodeName($hostname) . \pack('nn', $type, self::CLASS_IN);
-        $opt = $this->buildOptRecord();
-
-        return $header . $question . $opt;
-    }
-
-    /**
-     * Builds the EDNS0 OPT pseudo-record (RFC 6891): root name, TYPE=OPT,
-     * CLASS=advertised UDP payload size, TTL carries ext-RCODE(0)+version(0)+
-     * flags (DO bit set, requesting DNSSEC OK), empty RDATA.
-     *
-     * @return string
-     */
-    private function buildOptRecord(): string
-    {
-        return "\x00"
-            . \pack('n', self::TYPE_OPT)
-            . \pack('n', self::EDNS0_UDP_PAYLOAD_SIZE)
-            . \pack('N', 0x00008000) // ext-rcode=0, version=0, flags: DO=1
-            . \pack('n', 0);          // RDLENGTH=0
-    }
-
-    /**
-     * Encodes a hostname as a sequence of length-prefixed labels terminated by a zero byte.
-     *
-     * @param string $hostname
-     *
-     * @throws DnsQueryException When a label exceeds 63 bytes.
-     *
-     * @return string
-     */
-    private function encodeName(string $hostname): string
-    {
-        $encoded = '';
-
-        foreach (\explode('.', \trim($hostname, '.')) as $label) {
-            $length = \strlen($label);
-            if ($length > 63) {
-                throw new DnsQueryException("DNS label too long: {$label}");
-            }
-            $encoded .= \chr($length) . $label;
-        }
-
-        return $encoded . "\x00";
-    }
-
-    /**
-     * Parses a DNS response packet and extracts records of the queried type and a cache TTL.
-     *
-     * @param string $data Raw response packet.
-     * @param int $expectedId Query id the response must echo back.
-     * @param int $type DNS record type queried; only answer records of this type are collected.
-     *
-     * @throws DnsQueryException On a truncated/malformed packet, id mismatch,
-     *                           or an error RCODE other than NXDOMAIN (3).
-     *
-     * @return DnsAnswer
-     */
-    private function parseResponse(string $data, int $expectedId, int $type): DnsAnswer
-    {
-        if (\strlen($data) < 12) {
-            throw new DnsQueryException('DNS response shorter than header');
-        }
-
-        [$id, $flags, $qdcount, $ancount, $nscount] = \array_values(\unpack('nid/nflags/nqdcount/nancount/nnscount/narcount', $data));
-
-        if ($id !== $expectedId) {
-            throw new DnsQueryException('DNS response id mismatch (possible spoofing or stale reply)');
-        }
-
-        $authenticatedData = ($flags & self::FLAG_AD) !== 0;
-
-        $offset = 12;
-
-        for ($i = 0; $i < $qdcount; $i++) {
-            $this->decodeName($data, $offset);
-            $offset += 4; // QTYPE + QCLASS
-        }
-
-        $rcode = $flags & 0x000F;
-
-        if ($rcode === 3) {
-            // NXDOMAIN: not listed. A legitimate, successful result. The negative-caching
-            // TTL comes from the authority section's SOA record (RFC 2308), when present.
-            return new DnsAnswer([], $this->findSoaTtl($data, $offset, $nscount), $authenticatedData);
-        }
-        if ($rcode !== 0) {
-            throw new DnsQueryException("DNS response error RCODE={$rcode}");
-        }
-
-        $records = [];
-        $ttl = 0;
-        $ttlSet = false;
-        /** @var list<array{0: int, 1: string}> $mxEntries [preference, exchange] pairs, sorted into $records after the loop. */
-        $mxEntries = [];
-
-        for ($i = 0; $i < $ancount; $i++) {
-            $this->decodeName($data, $offset);
-
-            $meta = \unpack('ntype/nclass/Nttl/nrdlength', \substr($data, $offset, 10));
-            if ($meta === false) {
-                throw new DnsQueryException('Malformed answer record header');
-            }
-            $offset += 10;
-
-            $rdata = \substr($data, $offset, $meta['rdlength']);
-            $offset += $meta['rdlength'];
-
-            if ($meta['type'] !== $type) {
-                continue;
-            }
-
-            if ($type === self::TYPE_A && \strlen($rdata) === 4) {
-                $records[] = \sprintf('%d.%d.%d.%d', ...\array_values(\unpack('C4', $rdata)));
-                $ttl = $ttlSet ? \min($ttl, $meta['ttl']) : $meta['ttl'];
-                $ttlSet = true;
-            } elseif ($type === self::TYPE_AAAA && \strlen($rdata) === 16) {
-                $address = @\inet_ntop($rdata);
-                if ($address !== false) {
-                    $records[] = $address;
-                    $ttl = $ttlSet ? \min($ttl, $meta['ttl']) : $meta['ttl'];
-                    $ttlSet = true;
-                }
-            } elseif ($type === self::TYPE_PTR) {
-                // PTR rdata is a (possibly compressed) domain name, so it must be decoded
-                // against the full packet, not the already-extracted $rdata substring —
-                // a compression pointer inside it is an absolute offset into $data.
-                $nameOffset = $offset - $meta['rdlength'];
-                $name = $this->decodeName($data, $nameOffset);
-                if ($name !== '') {
-                    $records[] = $name;
-                    $ttl = $ttlSet ? \min($ttl, $meta['ttl']) : $meta['ttl'];
-                    $ttlSet = true;
-                }
-            } elseif ($type === self::TYPE_MX && \strlen($rdata) >= 3) {
-                $preference = \unpack('n', $rdata)[1];
-                // Exchange name follows the 2-byte preference; may be compressed, so
-                // decode against the full packet at its absolute offset, same as PTR above.
-                $nameOffset = $offset - $meta['rdlength'] + 2;
-                $exchange = $this->decodeName($data, $nameOffset);
-                if ($exchange !== '') {
-                    $mxEntries[] = [$preference, $exchange];
-                    $ttl = $ttlSet ? \min($ttl, $meta['ttl']) : $meta['ttl'];
-                    $ttlSet = true;
-                }
-            } elseif ($type === self::TYPE_TXT) {
-                $text = $this->decodeCharacterStrings($rdata);
-                $records[] = $text;
-                $ttl = $ttlSet ? \min($ttl, $meta['ttl']) : $meta['ttl'];
-                $ttlSet = true;
-            }
-        }
-
-        if ($type === self::TYPE_MX && $mxEntries !== []) {
-            \usort($mxEntries, static fn(array $a, array $b): int => $a[0] <=> $b[0]);
-            $records = \array_column($mxEntries, 1);
-        }
-
-        return new DnsAnswer($records, $ttlSet ? $ttl : 0, $authenticatedData);
-    }
-
-    /**
-     * Decodes a TXT record's RDATA: one or more length-prefixed character-strings,
-     * concatenated into a single string per the common resolver convention.
-     *
-     * @param string $rdata
-     *
-     * @return string
-     */
-    private function decodeCharacterStrings(string $rdata): string
-    {
-        $text = '';
-        $cursor = 0;
-        $len = \strlen($rdata);
-
-        while ($cursor < $len) {
-            $chunkLength = \ord($rdata[$cursor]);
-            $cursor++;
-            $text .= \substr($rdata, $cursor, $chunkLength);
-            $cursor += $chunkLength;
-        }
-
-        return $text;
-    }
-
-    /**
-     * Scans the authority section for an SOA record and returns its TTL.
-     *
-     * @param string $data Raw response packet.
-     * @param int $offset Byte offset of the authority section (past the question section).
-     * @param int $nscount Number of authority records to scan.
-     *
-     * @throws DnsQueryException On a malformed authority record header.
-     *
-     * @return int The SOA record's TTL, or 0 when no SOA record is present.
-     */
-    private function findSoaTtl(string $data, int $offset, int $nscount): int
-    {
-        for ($i = 0; $i < $nscount; $i++) {
-            $this->decodeName($data, $offset);
-
-            $meta = \unpack('ntype/nclass/Nttl/nrdlength', \substr($data, $offset, 10));
-            if ($meta === false) {
-                throw new DnsQueryException('Malformed authority record header');
-            }
-            $offset += 10 + $meta['rdlength'];
-
-            if ($meta['type'] === self::TYPE_SOA) {
-                return $meta['ttl'];
-            }
-        }
-
-        return 0;
-    }
-
-    /**
-     * Decodes a (possibly compressed) domain name starting at $offset, advancing it past the name.
-     *
-     * @param string $data
-     * @param int $offset Byte offset to start reading at; advanced past the encoded name.
-     *
-     * @throws DnsQueryException On a truncated name or a compression pointer loop.
-     *
-     * @return string Decoded, dot-separated domain name.
-     */
-    private function decodeName(string $data, int &$offset): string
-    {
-        $labels = [];
-        $seenPointers = [];
-        $cursor = $offset;
-        $jumped = false;
-
-        while (true) {
-            if ($cursor >= \strlen($data)) {
-                throw new DnsQueryException('Truncated domain name in DNS response');
-            }
-
-            $length = \ord($data[$cursor]);
-
-            if ($length === 0) {
-                $cursor++;
-                if (!$jumped) {
-                    $offset = $cursor;
-                }
-                break;
-            }
-
-            if (($length & 0xC0) === 0xC0) {
-                if ($cursor + 1 >= \strlen($data)) {
-                    throw new DnsQueryException('Truncated compression pointer in DNS response');
-                }
-                $pointer = (($length & 0x3F) << 8) | \ord($data[$cursor + 1]);
-                if (isset($seenPointers[$pointer])) {
-                    throw new DnsQueryException('DNS name compression pointer loop detected');
-                }
-                $seenPointers[$pointer] = true;
-
-                if (!$jumped) {
-                    $offset = $cursor + 2;
-                    $jumped = true;
-                }
-                $cursor = $pointer;
-                continue;
-            }
-
-            $labels[] = \substr($data, $cursor + 1, $length);
-            $cursor += 1 + $length;
-        }
-
-        return \implode('.', $labels);
+        return DnsMessageDecoder::decode($response, $id, $type);
     }
 }
