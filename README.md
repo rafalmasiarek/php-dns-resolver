@@ -13,9 +13,3 @@ DNS resolver contract with two implementations:
 - `FailoverDnsClient`: ordered multi-resolver failover, PSR-3 audit logging, and an optional total-timeout bounding every attempt across all configured resolvers combined.
 - `resolveManyA()`: concurrent batch A-record resolution over non-blocking sockets, with duplicate hostnames collapsed before querying.
 - `CachingDnsResolver`: TTL-respecting decorator for any `DnsResolverInterface`, backed by the included `InMemoryDnsCache` or a custom `DnsCacheInterface` implementation.
-
-## Not supported, deliberately
-
-- DNSSEC chain-of-trust validation (root-to-leaf). This client forwards to a trusted upstream resolver and reports its AD bit; full recursive validation is a different category of tool.
-- Async/Promise/Fiber execution. `resolveManyA()`'s non-blocking socket batch covers the "don't wait sequentially" need without an event-loop dependency.
-- Hosts-file resolution or system `resolv.conf` auto-detection — resolvers are always explicit.
