@@ -24,7 +24,7 @@ context:
     - `CachingDnsResolver`: TTL-respecting decorator for any `DnsResolverInterface`, backed by
       the included `InMemoryDnsCache` or a custom `DnsCacheInterface` implementation.
 
-includes:
+footer_includes:
   - docs/api.md
 
 authors:
